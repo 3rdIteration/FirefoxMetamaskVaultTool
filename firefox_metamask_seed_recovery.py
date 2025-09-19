@@ -8,6 +8,8 @@ import pathlib
 import re
 import os
 import json
+import configparser
+import platform
 
 
 
@@ -824,82 +826,186 @@ def print_vaults_from_sqlite_file(f):
 					continue
 				
 				print_vaults(content, f)
-				
+
 	except BaseException as ex:
 		pass
+
+SNAPPY_FRAMED_DATA_MAGIC_BYTES = bytes.fromhex("ff060000734e61507059")  # ....sNaPpY
+
+
+def get_default_firefox_profile_paths():
+	profile_dirs = set()
+	home = pathlib.Path.home()
+	system = platform.system()
+
+	possible_roots = []
+	if system == "Windows":
+		appdata = os.environ.get("APPDATA")
+		if appdata:
+			possible_roots.append(pathlib.Path(appdata) / "Mozilla" / "Firefox")
+	elif system == "Darwin":
+		possible_roots.append(home / "Library" / "Application Support" / "Firefox")
+	else:
+		possible_roots.append(home / ".mozilla" / "firefox")
+
+	for root in possible_roots:
+		profiles_ini = root / "profiles.ini"
+		if not profiles_ini.is_file():
+			continue
+
+		config = configparser.RawConfigParser()
+		try:
+			with profiles_ini.open("r", encoding="utf-8") as fh:
+				config.read_file(fh)
+		except (OSError, configparser.Error):
+			continue
+
+		def add_profile(path_value, is_relative=True):
+			if not path_value:
+				return
+
+			candidate = pathlib.Path(path_value)
+			if is_relative:
+				candidate = root / candidate
+
+			candidate = candidate.expanduser()
+			try:
+				candidate_resolved = candidate.resolve()
+			except OSError:
+				candidate_resolved = candidate
+
+			if candidate_resolved.is_dir():
+				profile_dirs.add(candidate_resolved)
+
+		for section in config.sections():
+			default_flag = config.get(section, "Default", fallback=None)
+
+			if section.startswith("Profile"):
+				if default_flag in ("1", "true", "True"):
+					path_value = config.get(section, "Path", fallback=None)
+					is_relative = True
+					if config.has_option(section, "IsRelative"):
+						try:
+							is_relative = config.getboolean(section, "IsRelative")
+						except ValueError:
+							is_relative = config.get(section, "IsRelative") != "0"
+					add_profile(path_value, is_relative)
+			elif section.startswith("Install"):
+				if default_flag:
+					add_profile(default_flag, True)
+
+	if not profile_dirs:
+		for root in possible_roots:
+			if not root.is_dir():
+				continue
+			for pattern in ("*.default*", "Profiles/*.default*"):
+				for candidate in root.glob(pattern):
+					if not candidate.is_dir():
+						continue
+					try:
+						profile_dirs.add(candidate.resolve())
+					except OSError:
+						profile_dirs.add(candidate)
+
+	return sorted(profile_dirs)
+
+
+def scan_sqlite_files(base_path: pathlib.Path):
+	for f in base_path.rglob('*.sqlite'):
+		if not f.is_file():
+			continue
+		print_vaults_from_sqlite_file(str(f))
+
+
+def scan_snappy_framed_files(base_path: pathlib.Path):
+	for f in base_path.rglob('*'):
+		if not f.is_file():
+			continue
+
+		try:
+			with open(f, "rb") as ff:
+				mb = ff.read(10)
+		except OSError:
+			continue
+
+		if mb != SNAPPY_FRAMED_DATA_MAGIC_BYTES:
+			continue
+
+		try:
+			with open(f, "rb") as ff:
+				d = Decompressor(ff)
+				decoded = d.read()
+		except Exception:
+			continue
+
+		decodedStr = decoded.decode(encoding='utf-8', errors="ignore")
+
+		pos = 0
+		stop = False
+		while not stop:
+			# If the file does not contain "salt":" it definitely doesn't contains Metamask vault data.
+			match = decodedStr.find('"salt":', pos)
+			if match == -1:
+				break
+
+			# Continue scanning 5000 characters before the first "salt":"
+			pos = max(pos, max(0, match - 5000))
+			match = decodedStr.find("{", pos)
+			if match == -1:
+				break
+
+			pos2 = pos
+			while True:
+				match2 = decodedStr.find("}", pos2)
+				if match2 == -1:
+					stop = True
+					break
+				if (match2 - match) > 10000:
+					# { .... } string is too long to be metamask vault data
+					pos = match2
+					stop = True
+					break
+				snippet = decodedStr[match:(match2+1)]
+
+				if "salt" not in snippet:
+					pos2 = match2 + 1
+				else:
+					try:
+						decodedSnippet = json.loads(snippet)
+						if 'data' in decodedSnippet and 'salt' in decodedSnippet:
+							print("---------------------------------------")
+							print("at:  ", f)
+							print("Found a Metamask vault:\n")
+							print(snippet)
+							print("\n---------------------------------------\n\n\n")
+						pos = match2
+						break
+					except:
+						#print("no decode")
+						pos2 = match2 + 1
+						continue
+
+
+def scan_directory(base_path: pathlib.Path):
+	base_path = base_path.expanduser()
+	if not base_path.exists():
+		return
+
+	print(f"Scanning all .sqlite files in {base_path} recursively...")
+	scan_sqlite_files(base_path)
+
+	print("Looking for 'snappy framed data' files recursively...")
+	scan_snappy_framed_files(base_path)
+
 
 if len(sys.argv) >= 2:
 	print_vaults_from_sqlite_file(sys.argv[1])
 else:
-	print("Scanning all .sqlite files in the current folder recursively...")
-	for f in pathlib.Path('.').glob('**/*.sqlite'):
-		if not os.path.isfile(f):
-			continue
-		print_vaults_from_sqlite_file(str(f))
-	
-	print("Looking for 'snappy framed data' files recursively...")
-	SNAPPY_FRAMED_DATA_MAGIC_BYTES = bytes.fromhex("ff060000734e61507059") # ....sNaPpY
-	
-	for f in pathlib.Path('.').glob('**/*'):
-		if not os.path.isfile(f):
-			continue
-		
-		with open(f, "rb") as ff:
-			mb = ff.read(10)
-		
-		if mb == SNAPPY_FRAMED_DATA_MAGIC_BYTES:
-			#print("Found a 'snappy framed data' file at", f)
-			
-			with open(f, "rb") as ff:
-				d = Decompressor(ff)
-				decoded = d.read()
-			decodedStr = decoded.decode(encoding='utf-8', errors="ignore")
-			
-			pos = 0
-			stop = False
-			while not stop:
-				# If the file does not contain "salt":" it definitely doesn't contains Metamask vault data.
-				match = decodedStr.find('"salt":', pos)
-				if match == -1:
-					break
-				
-				# Continue scanning 5000 characters before the first "salt":"
-				pos = max(pos, max(0, match - 5000))
-				match = decodedStr.find("{", pos)
-				if match == -1:
-					break
-				
-				
-				pos2 = pos
-				while True:
-					match2 = decodedStr.find("}", pos2)
-					if match2 == -1:
-						stop = True
-						break
-					if (match2 - match) > 10000:
-						# { .... } string is too long to be metamask vault data
-						pos = match2
-						stop = True
-						break
-					snippet = decodedStr[match:(match2+1)]
-					
-					if not "salt" in snippet:
-						pos2 = match2 + 1
-					else:
-						try:
-							decodedSnippet = json.loads(snippet)
-							if 'data' in decodedSnippet and 'salt' in decodedSnippet:
-								print("---------------------------------------")
-								print("at:  ", f)
-								print("Found a Metamask vault:\n")
-								print(snippet)
-								print("\n---------------------------------------\n\n\n")
-							pos = match2
-							break
-						except:
-							#print("no decode")
-							pos2 = match2 + 1
-							continue
-
-
-
+	default_profiles = get_default_firefox_profile_paths()
+	if default_profiles:
+		for profile_path in default_profiles:
+			print(f"Scanning Firefox profile: {profile_path}")
+			scan_directory(profile_path)
+	else:
+		print("No default Firefox profile directories found. Scanning the current folder recursively...")
+		scan_directory(pathlib.Path('.'))
