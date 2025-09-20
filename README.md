@@ -1,3 +1,10 @@
+# Background
+While tools like BTCRecover natively support extracting Metamask wallets from Chrome LevelDb files, Firefox data is stored in a different an incompatible way. Traditional Browser based methods for extracting the encrypted faults have also recently stopped working. This tool scans your system for Firefox profiles and attempts to retrieve the encrypted Metamask Vault.
+
+Once found, you can use the encrytped vault with other tools. 
+
+This tools is tested and works on Windows with Firefox 143.0.1
+
 # How to use
 1. Make sure you have Python 3 installed
 2. Install the python packages `snappy` and `cramjam`
